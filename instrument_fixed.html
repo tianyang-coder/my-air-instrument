@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>隔空体感乐器 - 纯净版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* 移除外部字体依赖，使用系统等宽字体确保像素风格 */
+        body {
+            font-family: monospace, sans-serif; 
+            background-color: #2c3e50; /* 深蓝色背景 */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: #ecf0f1;
+        }
+
+        #app-container {
+            background-color: #34495e; /* 稍浅的容器背景 */
+            border: 4px solid #f39c12; /* 橙色边框 */
+            box-shadow: 4px 4px 0px #e67e22; /* 像素化阴影 */
+            padding: 1rem;
+            max-width: 90vw;
+            width: 1000px;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            align-items: center;
+            border-radius: 8px; /* 增加圆角 */
+        }
+
+        /* 移除了 pixel-button 样式，因为已改为自动启动 */
+
+        #video-canvas-container {
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            aspect-ratio: 4/3; 
+            border: 2px solid #95a5a6;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        #output-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            background-color: #000000;
+        }
+
+        #video-element {
+            display: none; 
+        }
+
+        .loading-animation {
+            animation: pulse 1s infinite alternate;
+        }
+
+        @keyframes pulse {
+            from { opacity: 1; }
+            to { opacity: 0.7; }
+        }
+    </style>
+    <!-- 引入 Firebase/Firestore 和 Auth -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // 设置 Firebase 配置和 App ID
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        if (Object.keys(firebaseConfig).length > 0) {
+            const app = initializeApp(firebaseConfig);
+            const auth = getAuth(app);
+            const db = getFirestore(app); 
+            setLogLevel('debug'); 
+
+            window.authInstance = auth;
+            window.onAuthStateChanged = onAuthStateChanged;
+
+            // 修复了之前的变量名错误，确保正确读取初始认证令牌
+            const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+            async function authenticate() {
+                try {
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                } catch (error) {
+                    console.error("Firebase 认证失败:", error);
+                }
+            }
+            authenticate();
+        }
+    </script>
+</head>
+<body class="flex flex-col items-center justify-center p-4">
+
+    <div id="app-container">
+        <h1 class="text-3xl font-bold text-yellow-300 mb-4 text-center">隔空乐器演奏台 (纯净版)</h1>
+        <p class="text-sm text-center mb-4 text-gray-400">使用食指在乐器上“敲击”进行演奏。应用正在自动启动，请授权摄像头。</p>
+        
+        <div id="video-canvas-container">
+            <video id="video-element" class="hidden" playsinline></video>
+            <canvas id="output-canvas"></canvas>
+            
+            <div id="start-overlay" class="absolute inset-0 bg-gray-800 bg-opacity-95 flex flex-col items-center justify-center z-20">
+                <!-- 移除开始按钮，改为自动启动 -->
+                <p id="loading-text" class="mt-4 text-xl text-red-400 loading-animation">
+                    正在下载 MediaPipe 核心库... (正在自动启动)
+                </p>
+            </div>
+        </div>
+        
+        <div class="text-center text-sm mt-2">
+            当前用户 ID (用于数据安全): <span id="user-id" class="text-green-400">正在认证...</span>
+        </div>
+    </div>
+
+    <!-- 引入 MediaPipe Hands 和 Camera Utils -->
+    <script src="https://cdn.mediapipe.dev/hands/0.4/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.mediapipe.dev/camera_utils/0.3/camera_utils.js" crossorigin="anonymous"></script>
+    <!-- 引入 Tone.js 进行声音合成 -->
+    <script src="https://cdn.jsdelivr.net/npm/tone@14.8.49/build/Tone.min.js"></script>
+
+    <script>
+        // ----------------------------------------------------------------------
+        // 1. 全局状态 & 元素获取
+        // ----------------------------------------------------------------------
+        const videoElement = document.getElementById('video-element');
+        const canvasElement = document.getElementById('output-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        // 移除 startButton 
+        const loadingText = document.getElementById('loading-text');
+        const startOverlay = document.getElementById('start-overlay');
+        const userIdSpan = document.getElementById('user-id');
+
+        let isInitialized = false;
+        let mediaPipeReady = false; 
+        let modelTimeout = null; 
+        let noteParticles = [];
+        let lastIndexTipY = 0;
+        let isTapping = false;
+
+        let hands = null;
+        let camera = null;
+        const MODEL_LOAD_TIMEOUT_MS = 30000;
+
+        // ----------------------------------------------------------------------
+        // 2. 乐器配置 (Bounding Boxes)
+        // ----------------------------------------------------------------------
+        const INSTRUMENTS = [
+            { name: '吉他', id: 'guitar', sound: null, color: '#f39c12', emoji: '🎸', rect: [50, 400, 200, 300], lastTap: 0 },
+            { name: '鼓', id: 'drum', sound: null, color: '#e74c3c', emoji: '🥁', rect: [300, 450, 200, 250], lastTap: 0 },
+            { name: '小号', id: 'trumpet', sound: null, color: '#f1c40f', emoji: '🎺', rect: [550, 400, 200, 300], lastTap: 0 },
+            { name: '三角铁', id: 'triangle', sound: null, color: '#bdc3c7', emoji: '🔺', rect: [800, 450, 150, 250], lastTap: 0 }
+        ];
+
+        // ----------------------------------------------------------------------
+        // 3. Tone.js 声音设置
+        // ----------------------------------------------------------------------
+        function setupAudio() {
+            INSTRUMENTS.find(i => i.id === 'guitar').sound = new Tone.PluckSynth().toDestination();
+            INSTRUMENTS.find(i => i.id === 'drum').sound = new Tone.NoiseSynth({
+                noise: { type: 'pink' },
+                envelope: { attack: 0.005, decay: 0.1, sustain: 0, release: 0.2 }
+            }).toDestination();
+            INSTRUMENTS.find(i => i.id === 'trumpet').sound = new Tone.Synth({
+                oscillator: { type: 'square' },
+                envelope: { attack: 0.05, decay: 0.3, sustain: 0.1, release: 0.5 },
+                volume: -10
+            }).toDestination();
+            INSTRUMENTS.find(i => i.id === 'triangle').sound = new Tone.MetalSynth({
+                frequency: 200,
+                envelope: { attack: 0.001, decay: 0.2, release: 0.1 },
+                harmonicity: 5.1,
+                modulationIndex: 32,
+                octaves: 1,
+                volume: -15
+            }).toDestination();
+        }
+        
+        // 页面首次点击时启动 AudioContext
+        // 这是为了绕过浏览器对自动播放媒体的限制
+        document.documentElement.addEventListener('click', () => {
+            if (Tone.context.state !== 'running') {
+                Tone.start();
+            }
+        }, { once: true });
+
+
+        // ----------------------------------------------------------------------
+        // 4. MediaPipe Hands 设置 
+        // ----------------------------------------------------------------------
+        function onResults(results) {
+            // 首次成功获取结果时，清除模型加载超时计时器
+            if (modelTimeout) {
+                clearTimeout(modelTimeout);
+                modelTimeout = null; 
+                console.log("MediaPipe Model confirmed loaded via onResults.");
+            }
+
+            const width = 1000;
+            const height = 750;
+            canvasElement.width = width;
+            canvasElement.height = height;
+
+            canvasCtx.save();
+            // 镜像翻转视频流，使手部运动符合直觉
+            canvasCtx.clearRect(0, 0, width, height);
+            canvasCtx.scale(-1, 1);
+            canvasCtx.translate(-width, 0);
+            canvasCtx.drawImage(results.image, 0, 0, width, height);
+            canvasCtx.restore();
+
+            drawInstruments(width, height);
+
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    const indexTip = landmarks[8]; // 获取食指指尖 (Landmark 8)
+                    const x = width - (indexTip.x * width); // 转换坐标并镜像
+                    const y = indexTip.y * height;
+                    
+                    drawIndexTip(x, y);
+
+                    const currentTime = performance.now();
+                    // 检测垂直方向上的快速移动 (敲击)
+                    const tapSpeed = Math.abs(y - lastIndexTipY); 
+
+                    // 阈值判断是否正在敲击
+                    let isCurrentlyTapping = tapSpeed > 5;
+
+                    if (isCurrentlyTapping && !isTapping) {
+                        checkTouch(x, y, currentTime);
+                    }
+                    
+                    isTapping = isCurrentlyTapping;
+                    lastIndexTipY = y;
+                }
+            }
+
+            drawNoteParticles();
+        }
+
+        function handleModelStuck() {
+            clearTimeout(modelTimeout);
+            loadingText.textContent = '❌ 模型加载超时！请检查网络，然后刷新页面重试。';
+            loadingText.classList.remove('loading-animation', 'text-yellow-400'); 
+            loadingText.classList.add('text-red-600');
+            console.error("MediaPipe Model Load Timeout: Failed to download model files.");
+        }
+
+
+        function initializeMediaPipe() {
+            hands = new Hands({
+                locateFile: (file) => {
+                    return `https://cdn.mediapipe.dev/hands/0.4/${file}`;
+                }
+            });
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 0, 
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onResults);
+            
+            // 库加载完成后，更新状态并立即尝试启动摄像头
+            loadingText.textContent = '✅ 核心模型加载完毕，正在请求摄像头权限...';
+            loadingText.classList.remove('loading-animation'); // 停止动画
+            loadingText.classList.remove('text-red-400');
+            loadingText.classList.add('text-yellow-400'); // 提示色
+            
+            camera = new Camera(videoElement, {
+                onFrame: async () => {
+                    if (isInitialized && hands) {
+                        await hands.send({ image: videoElement });
+                    }
+                    requestAnimationFrame(animateParticles);
+                },
+                width: 1000,
+                height: 750
+            });
+            
+            // 自动启动摄像头
+            startCamera();
+        }
+        
+        // ----------------------------------------------------------------------
+        // 5. 绘图函数 
+        // ----------------------------------------------------------------------
+
+        function drawInstruments(width, height) {
+            const font = 'monospace, sans-serif'; 
+            canvasCtx.textBaseline = 'middle';
+            canvasCtx.textAlign = 'center';
+
+            INSTRUMENTS.forEach(inst => {
+                const [x, y, w, h] = inst.rect;
+
+                // 绘制乐器主体
+                canvasCtx.fillStyle = inst.color;
+                canvasCtx.fillRect(x, y, w, h);
+                canvasCtx.strokeStyle = '#2c3e50';
+                canvasCtx.lineWidth = 6;
+                canvasCtx.strokeRect(x, y, w, h);
+
+                // 绘制乐器图标 (Emoji)
+                canvasCtx.fillStyle = '#ecf0f1';
+                canvasCtx.font = `bold 60px ${font}`;
+                canvasCtx.fillText(inst.emoji, x + w / 2, y + h / 2 - 20);
+
+                // 绘制乐器名称
+                canvasCtx.font = `bold 30px ${font}`;
+                canvasCtx.fillText(inst.name, x + w / 2, y + h / 2 + 30);
+                
+                // 像素边框效果
+                canvasCtx.strokeStyle = '#000000';
+                canvasCtx.lineWidth = 2;
+                canvasCtx.strokeRect(x + 5, y + 5, w - 10, h - 10);
+            });
+        }
+
+        function drawIndexTip(x, y) {
+            const size = 20;
+            // 绘制红色方块作为指尖指示器
+            canvasCtx.fillStyle = '#ff0000';
+            canvasCtx.fillRect(x - size / 2, y - size / 2, size, size);
+            
+            // 绘制白色边框
+            canvasCtx.strokeStyle = '#ffffff';
+            canvasCtx.lineWidth = 4;
+            canvasCtx.strokeRect(x - size / 2, y - size / 2, size, size);
+            
+            // 绘制黄色中心点
+            canvasCtx.fillStyle = '#ffff00';
+            canvasCtx.fillRect(x - 2, y - 2, 4, 4);
+        }
+
+        function drawNoteParticles() {
+            noteParticles.forEach(p => {
+                canvasCtx.font = `${p.size}px monospace`;
+                canvasCtx.fillStyle = p.color;
+                canvasCtx.fillText(p.char, p.x, p.y);
+            });
+        }
+        
+        // ----------------------------------------------------------------------
+        // 6. 粒子动画 
+        // ----------------------------------------------------------------------
+
+        function createNoteParticle(x, y, color) {
+            const notes = ['🎵', '🎶', '♩', '♪', '♫', '♬'];
+            noteParticles.push({
+                x: x,
+                y: y,
+                vx: (Math.random() - 0.5) * 5, // 水平速度
+                vy: -(Math.random() * 10 + 5), // 向上速度
+                char: notes[Math.floor(Math.random() * notes.length)],
+                size: 20,
+                color: color,
+                life: 60 // 生命周期
+            });
+        }
+
+        function animateParticles() {
+            noteParticles = noteParticles.map(p => {
+                p.x += p.vx;
+                p.y += p.vy;
+                p.vy *= 0.95; // 模拟重力减速
+                p.life--;
+                return p;
+            }).filter(p => p.life > 0);
+        }
+        
+        // ----------------------------------------------------------------------
+        // 7. 交互与声音逻辑 
+        // ----------------------------------------------------------------------
+
+        function checkTouch(tipX, tipY, currentTime) {
+            INSTRUMENTS.forEach(inst => {
+                const [x, y, w, h] = inst.rect;
+                
+                // 检查指尖是否在乐器边界内
+                if (tipX > x && tipX < x + w && tipY > y && tipY < y + h) {
+                    
+                    const timeSinceLastTap = currentTime - inst.lastTap;
+                    inst.lastTap = currentTime;
+
+                    // 根据敲击速度 (BPM) 调整声音参数 (例如鼓的衰减时间)
+                    const minBPM = 60;
+                    const maxBPM = 240;
+                    const minInterval = 100; // 最快敲击间隔 (ms)
+                    const maxInterval = 1000; // 最慢敲击间隔 (ms)
+                    
+                    let mappedBPM = minBPM;
+                    if (timeSinceLastTap < maxInterval) {
+                        const clampedInterval = Math.max(minInterval, Math.min(maxInterval, timeSinceLastTap));
+                        const normalized = 1 - (clampedInterval - minInterval) / (maxInterval - minInterval);
+                        mappedBPM = minBPM + normalized * (maxBPM - minBPM);
+                    }
+                    
+                    const intervalInSeconds = 60 / mappedBPM;
+
+                    playSound(inst, intervalInSeconds);
+
+                    // 创建音符粒子特效
+                    createNoteParticle(x + w / 2, y, inst.color);
+                    
+                    return; 
+                }
+            });
+        }
+        
+        function playSound(inst, interval) {
+            if (Tone.context.state !== 'running') {
+                Tone.start();
+            }
+
+            switch (inst.id) {
+                case 'guitar':
+                    // 吉他: 拨弦音
+                    inst.sound.triggerAttackRelease('C4', '8n');
+                    break;
+                case 'drum':
+                    // 鼓: 噪波音，衰减时间与敲击速度相关
+                    inst.sound.triggerAttackRelease(interval / 2);
+                    break;
+                case 'trumpet':
+                    // 小号: 方波，持续时间与敲击速度相关
+                    inst.sound.oscillator.type = 'square';
+                    inst.sound.triggerAttackRelease('G4', interval / 1.5, Tone.now(), 0.5);
+                    break;
+                case 'triangle':
+                    // 三角铁: 金属合成音，频率略微随机
+                    inst.sound.triggerAttackRelease(250 + Math.random() * 50, 0.5);
+                    break;
+            }
+        }
+
+        // ----------------------------------------------------------------------
+        // 8. 启动逻辑 
+        // ----------------------------------------------------------------------
+
+        async function startCamera() {
+            setupAudio(); // 初始化声音
+            
+            try {
+                if (camera) {
+                    await camera.start(); // 尝试启动摄像头
+                }
+                
+                isInitialized = true;
+                startOverlay.classList.add('hidden'); // 启动成功后隐藏覆盖层
+                
+                // 处理 Firebase 认证状态显示
+                const auth = window.authInstance;
+                const onAuthStateChanged = window.onAuthStateChanged;
+                
+                if (auth && onAuthStateChanged) {
+                    onAuthStateChanged(auth, user => {
+                        if (user) {
+                            userIdSpan.textContent = user.uid;
+                        } else {
+                            userIdSpan.textContent = '匿名';
+                        }
+                    });
+                } else {
+                    userIdSpan.textContent = 'Firebase 未初始化';
+                }
+
+            } catch (error) {
+                console.error('无法启动摄像头:', error);
+                startOverlay.classList.remove('hidden');
+                loadingText.classList.remove('hidden');
+                loadingText.classList.remove('text-yellow-400');
+                loadingText.textContent = `❌ 启动失败: ${error.name}. 请检查摄像头权限，然后刷新页面重试。`;
+            }
+        }
+
+        function checkMediaPipeReady() {
+            if (mediaPipeReady) return; 
+
+            // 检查 MediaPipe 库是否加载完毕
+            if (typeof Hands !== 'undefined' && typeof Camera !== 'undefined') {
+                initializeMediaPipe(); 
+                mediaPipeReady = true;
+                
+                // 启动模型加载超时计时器
+                modelTimeout = setTimeout(handleModelStuck, MODEL_LOAD_TIMEOUT_MS); 
+                
+            } else {
+                // 如果没有加载完毕，稍后重试
+                setTimeout(checkMediaPipeReady, 100);
+            }
+        }
+
+        window.addEventListener('resize', () => {
+            const container = document.getElementById('video-canvas-container');
+            canvasElement.style.width = container.offsetWidth + 'px';
+            canvasElement.style.height = container.offsetHeight + 'px';
+        });
+
+        window.onload = () => {
+            const container = document.getElementById('video-canvas-container');
+            canvasElement.style.width = container.offsetWidth + 'px';
+            canvasElement.style.height = container.offsetHeight + 'px';
+
+            // 页面加载完成直接开始 MediaPipe 检查和自动启动流程
+            checkMediaPipeReady(); 
+        };
+
+    </script>
+</body>
+</html
